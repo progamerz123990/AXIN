@@ -1,4 +1,4 @@
-"""AXIN Core API v0.2 — Gemini model cycling with quota-aware fallback.
+"""AXIN Core API v0.3 — Gemini model cycling with quota-aware fallback.
 
 Dependency-free development server. Configure AXIN_API_KEY locally.
 Never commit API keys or the SQLite database to GitHub.
@@ -22,7 +22,7 @@ DB_PATH = Path(os.getenv("AXIN_DB_PATH", "axin_memory.sqlite3"))
 API_KEY = os.getenv("AXIN_API_KEY", "").strip()
 # Ordered strongest/preferred first. Override this list if model availability changes.
 MODEL_NAMES = [m.strip() for m in os.getenv(
-    "AXIN_MODELS", "gemini-2.5-flash,gemini-2.5-flash-lite"
+    "AXIN_MODELS", "gemini-3.8-flash,gemini-3.5-flash-lite"
 ).split(",") if m.strip()]
 MAX_HISTORY = int(os.getenv("AXIN_MAX_HISTORY", "12"))
 DEFAULT_COOLDOWN = max(15, int(os.getenv("AXIN_DEFAULT_COOLDOWN_SECONDS", "60")))
@@ -216,14 +216,21 @@ def choose_and_ask(messages: list[dict]) -> tuple[str, str]:
                 mark_cooldown(model, exc.retry_after or 30)
                 print(f"[AXIN] {model} temporarily unavailable; trying fallback.")
                 continue
-            # Authentication/model-not-found/bad-request errors should be surfaced,
-            # not silently treated as exhausted quota.
+            # Some projects cannot access older/restricted model IDs. If Google
+            # explicitly reports a model as unavailable/not found, cool it down
+            # and try the next configured model rather than stopping the request.
+            lowered = str(exc).lower()
+            if exc.status == 404 or ("model" in lowered and ("not found" in lowered or "no longer available" in lowered or "not available" in lowered)):
+                mark_cooldown(model, max(DEFAULT_COOLDOWN, 3600))
+                print(f"[AXIN] {model} is unavailable to this project; trying fallback.")
+                continue
+            # Authentication and malformed-request errors should be surfaced.
             raise
     raise ProviderError("No configured Gemini model is currently available. " + "; ".join(skipped), status=429, quota=True)
 
 
 class AxinHandler(BaseHTTPRequestHandler):
-    server_version = "AXIN-Core/0.2.0"
+    server_version = "AXIN-Core/0.3.0"
 
     def send_json(self, status, payload):
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -243,7 +250,7 @@ class AxinHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/health":
             return self.send_json(200, {
-                "ok": True, "service": "axin-core", "version": "0.2.0",
+                "ok": True, "service": "axin-core", "version": "0.3.0",
                 "ai_configured": bool(API_KEY), "provider": "google-gemini",
                 "models_priority": MODEL_NAMES,
                 "models_cooling_down": {m: round(cooldown_remaining(m)) for m in MODEL_NAMES if cooldown_remaining(m) > 0},
